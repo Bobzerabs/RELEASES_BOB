@@ -1,0 +1,148 @@
+name: Build EXE (custom)
+
+# Runs automatically on every push to main, and can still be started by hand
+# from Actions -> Build EXE (custom) -> Run workflow.
+#
+# Besides the installer this publishes `latest.json` to the rolling
+# "custom-latest" release. Installed copies of Bloom read it on every launch
+# (see plugins.updater.endpoints in src-tauri/tauri.conf.json), show what is
+# new (release-notes.md) and update themselves.
+#
+# One-time setup (Settings -> Secrets and variables -> Actions):
+#  - TAURI_SIGNING_PRIVATE_KEY: without it the installer is still built, but
+#    installed copies cannot update themselves.
+#  - RELEASES_TOKEN: a fine-grained personal access token with "Contents:
+#    Read and write" on the PUBLIC releases repository (RELEASES_REPO below).
+#    This repository can stay private; only installers and latest.json are
+#    published to the public one, because the in-app updater downloads them
+#    without logging in.
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "website/**"
+  workflow_dispatch:
+
+# A newer push cancels a build that is still running.
+concurrency:
+  group: build-exe-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      RELEASES_REPO: Bobzerabs/bloom-releases
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend dependencies
+        run: bun install
+
+      # Every build gets a higher version than the last one, otherwise installed
+      # copies would not see it as an update: patch * 100000 + run number
+      # (3.9.2 -> 3.9.200017, the next upstream 3.9.3 -> 3.9.300018, ...).
+      - name: Compute build version
+        id: ver
+        shell: bash
+        run: |
+          BASE=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          MAJOR=$(echo "$BASE" | cut -d. -f1)
+          MINOR=$(echo "$BASE" | cut -d. -f2)
+          PATCH=$(echo "$BASE" | cut -d. -f3 | sed 's/[^0-9].*//')
+          VERSION="$MAJOR.$MINOR.$((PATCH * 100000 + GITHUB_RUN_NUMBER))"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building $VERSION"
+
+      # Signed updater artifacts need the private key; without it just build
+      # the installer.
+      - name: Build Bloom
+        shell: bash
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          if [ -n "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            bun run tauri build --bundles nsis --config "{\"version\":\"$VERSION\"}"
+          else
+            echo "::warning::TAURI_SIGNING_PRIVATE_KEY is not set: building without auto-update support."
+            bun run tauri build --bundles nsis --config "{\"version\":\"$VERSION\",\"bundle\":{\"createUpdaterArtifacts\":false}}"
+          fi
+
+      - name: Prepare release files
+        shell: bash
+        run: |
+          mkdir -p out
+          INSTALLER=$(ls src-tauri/target/release/bundle/nsis/*-setup.exe | head -n 1)
+          cp "$INSTALLER" out/bloom-setup.exe
+          # SHA-256 so anyone can check the download matches this build.
+          (cd out && sha256sum bloom-setup.exe > bloom-setup.exe.sha256)
+          if [ -f "$INSTALLER.sig" ]; then
+            cp "$INSTALLER.sig" out/bloom-setup.exe.sig
+            node -e '
+              const fs = require("fs");
+              const notes = fs.existsSync("release-notes.md") ? fs.readFileSync("release-notes.md", "utf8").trim() : "";
+              const repo = process.env.RELEASES_REPO;
+              const manifest = {
+                version: process.env.VERSION,
+                notes,
+                pub_date: new Date().toISOString().replace(/\.\d+Z$/, "Z"),
+                platforms: {
+                  "windows-x86_64": {
+                    signature: fs.readFileSync("out/bloom-setup.exe.sig", "utf8").trim(),
+                    url: `https://github.com/${repo}/releases/download/custom-latest/bloom-setup.exe`
+                  }
+                }
+              };
+              fs.writeFileSync("out/latest.json", JSON.stringify(manifest, null, 2));
+            '
+          else
+            echo "No signature produced: latest.json will not be published."
+          fi
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          RELEASES_REPO: ${{ env.RELEASES_REPO }}
+
+      # Keeps one rolling release called "custom-latest" with the newest installer
+      # (and latest.json for the in-app updater).
+      - name: Publish to Releases (custom-latest)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Secret RELEASES_TOKEN is not set (needs Contents: write on $RELEASES_REPO)."
+            exit 1
+          fi
+          SHORT_SHA="${GITHUB_SHA::7}"
+          HASH=$(cut -d' ' -f1 out/bloom-setup.exe.sha256)
+          cp release-notes.md release-body.md
+          {
+            echo ""
+            echo "---"
+            echo "**SHA-256 (bloom-setup.exe):** \`$HASH\`"
+            echo ""
+            echo "Windows may warn about an unsigned installer from an unknown publisher. Bloom is open source; compare the hash above with your download (PowerShell: \`Get-FileHash bloom-setup.exe\`)."
+          } >> release-body.md
+          gh release delete custom-latest --yes --cleanup-tag --repo "$RELEASES_REPO" || true
+          gh release create custom-latest out/* \
+            --repo "$RELEASES_REPO" \
+            --title "Bloom $VERSION ($SHORT_SHA)" \
+            --notes-file release-body.md \
+            --prerelease
